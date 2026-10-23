@@ -1,15 +1,18 @@
 """
 Train, validate and test a model on the ADNI AD vs NC task.
 
-Example:
+Examples:
     python train.py --model baseline --epochs 20 --out outputs/baseline
-    python train.py --model baseline --smoke          # quick pipeline check
+    python train.py --model convnext --pretrained --epochs 30 --lr 1e-4 \
+        --weight-decay 0.05 --warmup-epochs 3 --label-smoothing 0.1 --out outputs/convnext
+    python train.py --model convnext --pretrained --smoke   # quick pipeline check
 
 The checkpoint with the best validation accuracy is saved and evaluated once
 on the held-out test set at the end of training.
 """
 import argparse
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -36,11 +39,16 @@ def parse_args():
     p.add_argument("--data-root", default=DATA_ROOT)
     p.add_argument("--out", default="outputs/baseline")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--pretrained", action="store_true", help="ImageNet weights (convnext only)")
+    p.add_argument("--drop-path", type=float, default=0.1, help="stochastic depth rate (convnext only)")
+    p.add_argument("--warmup-epochs", type=float, default=0, help="linear LR warmup before cosine decay")
+    p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--no-amp", action="store_true", help="disable bfloat16 mixed precision on GPU")
     p.add_argument("--smoke", action="store_true", help="tiny subset, 1 epoch, for debugging")
     return p.parse_args()
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None):
+def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, amp=False):
     """One pass over `loader`. Trains if an optimizer is given, otherwise evaluates.
 
     Returns mean loss, slice accuracy, and per-slice (prob_AD, label, patient_id)
@@ -54,13 +62,18 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     with torch.set_grad_enabled(training):
         for x, y, pid in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            logits = model(x)
-            loss = criterion(logits, y)
+            # bfloat16 autocast: faster on A100 and halves activation memory
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+                logits = model(x)
+                loss = criterion(logits, y)
+            logits = logits.float()
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()                  # LR is updated every iteration
 
             total_loss += loss.item() * x.size(0)
             correct += (logits.argmax(1) == y).sum().item()
@@ -70,6 +83,26 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             pids.extend(pid)
 
     return total_loss / n, correct / n, torch.cat(probs), torch.cat(labels), pids
+
+
+def make_optimizer(model, lr, weight_decay):
+    """AdamW without weight decay on biases, norm weights and Layer Scale (1-D params)."""
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if p.requires_grad:
+            (no_decay if p.ndim <= 1 else decay).append(p)
+    return torch.optim.AdamW([{"params": decay, "weight_decay": weight_decay},
+                              {"params": no_decay, "weight_decay": 0.0}], lr=lr)
+
+
+def make_scheduler(optimizer, warmup_steps, total_steps):
+    """Linear warmup from ~0 to the base LR, then cosine decay to 0."""
+    def factor(step):
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
 def patient_level(probs, labels, pids):
@@ -127,12 +160,15 @@ def main():
     print(f"Slices  train={len(loaders['train'].dataset)}  val={len(loaders['val'].dataset)}  "
           f"test={len(loaders['test'].dataset)}  | mean={mean:.4f} std={std:.4f}")
 
-    model = build_model(args.model).to(device)
-    print(f"Model: {args.model}  trainable params: {count_parameters(model):,}")
+    model = build_model(args.model, pretrained=args.pretrained, drop_path=args.drop_path).to(device)
+    print(f"Model: {args.model}  pretrained={args.pretrained}  trainable params: {count_parameters(model):,}")
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    amp = device.type == "cuda" and not args.no_amp
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    optimizer = make_optimizer(model, args.lr, args.weight_decay)
+    steps_per_epoch = len(loaders["train"])
+    scheduler = make_scheduler(optimizer, int(args.warmup_epochs * steps_per_epoch),
+                               args.epochs * steps_per_epoch)
 
     history = defaultdict(list)
     best_val, ckpt_path = -1.0, os.path.join(args.out, "best.pt")
@@ -141,30 +177,31 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_acc, *_ = run_epoch(model, loaders["train"], criterion, device, optimizer)
-        va_loss, va_acc, va_p, va_y, va_pid = run_epoch(model, loaders["val"], criterion, device)
+        lr_now = optimizer.param_groups[0]["lr"]
+        tr_loss, tr_acc, *_ = run_epoch(model, loaders["train"], criterion, device, optimizer, scheduler, amp)
+        va_loss, va_acc, va_p, va_y, va_pid = run_epoch(model, loaders["val"], criterion, device, amp=amp)
         va_pat_acc = summarise(*patient_level(va_p, va_y, va_pid))["acc"]
-        scheduler.step()
 
         for k, v in [("train_loss", tr_loss), ("train_acc", tr_acc), ("val_loss", va_loss),
-                     ("val_acc", va_acc), ("val_patient_acc", va_pat_acc)]:
+                     ("val_acc", va_acc), ("val_patient_acc", va_pat_acc), ("lr", lr_now),
+                     ("epoch_time_s", time.time() - t0)]:
             history[k].append(v)
         print(f"Epoch {epoch:3d}/{args.epochs} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | "
               f"val loss {va_loss:.4f} acc {va_acc:.4f} patient-acc {va_pat_acc:.4f} | "
-              f"{time.time() - t0:.0f}s")
+              f"lr {lr_now:.2e} | {time.time() - t0:.0f}s")
 
         # Model selection uses the validation set only (never the test set).
         if va_acc > best_val:
             best_val = va_acc
             torch.save({"model": args.model, "state_dict": model.state_dict(),
-                        "mean": mean, "std": std, "epoch": epoch}, ckpt_path)
+                        "mean": mean, "std": std, "epoch": epoch, "args": vars(args)}, ckpt_path)
 
         plot_history(history, os.path.join(args.out, "curves.png"))
 
     # ---- Final, one-off evaluation on the held-out test set ----
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["state_dict"])
-    _, _, te_p, te_y, te_pid = run_epoch(model, loaders["test"], criterion, device)
+    _, _, te_p, te_y, te_pid = run_epoch(model, loaders["test"], criterion, device, amp=amp)
     results = {
         "model": args.model,
         "best_epoch": ckpt["epoch"],
