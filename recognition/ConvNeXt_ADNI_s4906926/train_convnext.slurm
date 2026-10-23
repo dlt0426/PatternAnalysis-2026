@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=adni_convnext
-#SBATCH --partition=comp3710          # check available GPU partitions with `sinfo`
+#SBATCH --partition=comp3710
+#SBATCH --account=comp3710
+#SBATCH --qos=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=04:00:00
