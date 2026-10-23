@@ -14,8 +14,18 @@ Method (model-independent, raw pixels only):
   * If val scans have far closer train neighbours than test scans, the val
     split contains repeat scans of training subjects.
 
+Fix (--make-groups):
+  * Scan IDs in the official train set whose fingerprints are more similar
+    than `threshold` are linked; connected components (union-find) become
+    "subject groups", saved to splits/train_groups.json. dataset.py then
+    splits train/val by group instead of by scan ID.
+  * Default threshold = 99th percentile of test->train similarity, i.e. a
+    pair is merged only if it is closer than 99% of genuinely different
+    subjects (the official test set is subject-disjoint from train).
+
 Usage:
-    python audit_split.py                    # writes outputs/audit/
+    python audit_split.py                    # audit the current split -> outputs/audit/
+    python audit_split.py --make-groups      # build subject groups, then audit the new split
 """
 import argparse
 import json
@@ -29,7 +39,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dataset import get_splits, patient_id, DATA_ROOT
+from dataset import get_splits, collect, patient_id, DATA_ROOT, GROUPS_FILE
 
 SIZE = 32
 
@@ -70,18 +80,45 @@ def describe(name, s, agree):
             "nn_label_agreement": agree.float().mean().item()}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-root", default=DATA_ROOT)
-    ap.add_argument("--out", default="outputs/audit")
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
+def make_groups(ids, labels, feats, threshold):
+    """Union-find over scan IDs: link every pair with similarity > threshold."""
+    parent = list(range(len(ids)))
 
-    train, val, test = get_splits(args.data_root)
-    print("Building fingerprints (CPU, a few minutes)...")
-    tr_ids, tr_y, tr_f = fingerprints(train)
-    va_ids, va_y, va_f = fingerprints(val)
-    te_ids, te_y, te_f = fingerprints(test)
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    sim = feats @ feats.T
+    sim.fill_diagonal_(-1.0)
+    for i, j in torch.nonzero(torch.triu(sim > threshold)).tolist():
+        parent[find(i)] = find(j)
+
+    groups = {pid: f"g{ids[find(k)]}" for k, pid in enumerate(ids)}
+    members = defaultdict(list)
+    for k, pid in enumerate(ids):
+        members[groups[pid]].append(k)
+    sizes = sorted((len(m) for m in members.values()), reverse=True)
+    mixed = sum(1 for m in members.values() if len({labels[k].item() for k in m}) > 1)
+    size_hist = {s: sizes.count(s) for s in sorted(set(sizes))}
+    print(f"\nGrouping @ threshold {threshold:.4f}: {len(ids)} scan IDs -> {len(members)} subject groups")
+    print(f"  group size histogram {{size: count}}: {size_hist}")
+    print(f"  largest group: {sizes[0]}   groups with mixed AD/NC labels: {mixed}")
+    return groups, {"threshold": threshold, "n_scans": len(ids), "n_groups": len(members),
+                    "size_histogram": size_hist, "mixed_label_groups": mixed}
+
+
+def audit(train, val, test, feats, out):
+    """Nearest-train-neighbour statistics for the current train/val split."""
+    def subset(items):
+        keep = sorted({patient_id(p) for p, _ in items})
+        idx = torch.tensor([feats["index"][k] for k in keep])
+        return keep, feats["labels"][idx], feats["matrix"][idx]
+
+    tr_ids, tr_y, tr_f = subset(train)
+    va_ids, va_y, va_f = subset(val)
+    te_ids, te_y, te_f = feats["test"]
 
     s_tt, i_tt = nearest(tr_f, tr_f, exclude_self=True)   # train vs other train (reference)
     s_va, i_va = nearest(va_f, tr_f)
@@ -95,11 +132,12 @@ def main():
     thr = torch.quantile(s_te, 0.99).item()
     for r, s in zip(rows, (s_tt, s_va, s_te)):
         r["frac_above_test_p99"] = (s > thr).float().mean().item()
+        r["max"] = s.max().item()
 
-    print(f"\n{'split':13s} {'n':>5s} {'p10':>7s} {'median':>7s} {'p90':>7s} "
+    print(f"\n{'split':13s} {'n':>5s} {'p10':>7s} {'median':>7s} {'p90':>7s} {'max':>7s} "
           f"{'>test p99':>10s} {'1-NN label agree':>17s}")
     for r in rows:
-        print(f"{r['split']:13s} {r['n']:5d} {r['p10']:7.3f} {r['median']:7.3f} {r['p90']:7.3f} "
+        print(f"{r['split']:13s} {r['n']:5d} {r['p10']:7.3f} {r['median']:7.3f} {r['p90']:7.3f} {r['max']:7.4f} "
               f"{r['frac_above_test_p99']:10.1%} {r['nn_label_agreement']:17.1%}")
     print(f"(test p99 similarity threshold = {thr:.3f})")
 
@@ -119,10 +157,44 @@ def main():
     plt.axvline(thr, color="k", ls="--", lw=1, label="test 99th percentile")
     plt.xlabel("cosine similarity to nearest training scan (raw pixels)")
     plt.ylabel("density"); plt.legend(); plt.title("Nearest-neighbour audit of splits")
-    plt.tight_layout(); plt.savefig(os.path.join(args.out, "nn_audit.png"), dpi=150)
+    plt.tight_layout(); plt.savefig(os.path.join(out, "nn_audit.png"), dpi=150)
+    plt.close()
+    return {"summary": rows, "threshold_test_p99": thr, "top_val_pairs": pairs}
 
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", default=DATA_ROOT)
+    ap.add_argument("--out", default="outputs/audit")
+    ap.add_argument("--make-groups", action="store_true", help="build splits/train_groups.json")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="similarity above which two scan IDs are merged (default: test->train p99)")
+    args = ap.parse_args()
+    os.makedirs(args.out, exist_ok=True)
+
+    print("Building fingerprints (CPU, a few minutes)...")
+    all_ids, all_y, all_f = fingerprints(collect(os.path.join(args.data_root, "train")))
+    test = fingerprints(collect(os.path.join(args.data_root, "test")))
+    feats = {"index": {pid: k for k, pid in enumerate(all_ids)}, "labels": all_y,
+             "matrix": all_f, "test": test}
+
+    report = {}
+    if args.make_groups:
+        thr = args.threshold
+        if thr is None:
+            thr = torch.quantile(nearest(test[2], all_f)[0], 0.99).item()
+        groups, stats = make_groups(all_ids, all_y, all_f, thr)
+        os.makedirs(os.path.dirname(GROUPS_FILE), exist_ok=True)
+        with open(GROUPS_FILE, "w") as f:
+            json.dump({**stats, "groups": groups}, f, indent=1)
+        print(f"Saved {GROUPS_FILE}")
+        report["grouping"] = stats
+
+    train, val, _ = get_splits(args.data_root)
+    print(f"\nAuditing split: train={len(train)} slices, val={len(val)} slices")
+    report.update(audit(train, val, None, feats, args.out))
     with open(os.path.join(args.out, "nn_audit.json"), "w") as f:
-        json.dump({"summary": rows, "threshold_test_p99": thr, "top_val_pairs": pairs}, f, indent=2)
+        json.dump(report, f, indent=2)
     print(f"\nSaved nn_audit.png and nn_audit.json to {args.out}/")
 
 

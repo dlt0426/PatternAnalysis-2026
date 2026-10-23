@@ -6,6 +6,7 @@ All slices of one patient are kept in the same split to prevent leakage.
 """
 import os
 import glob
+import json
 import random
 from collections import defaultdict
 
@@ -15,6 +16,9 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 DATA_ROOT = "/home/groups/comp3710/ADNI/AD_NC"
+# Scan-ID -> subject-group mapping produced by `python audit_split.py --make-groups`.
+# Scan IDs whose images are near-identical are treated as the same subject.
+GROUPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "splits", "train_groups.json")
 CLASSES = {"NC": 0, "AD": 1}
 IMG_SIZE = 224
 
@@ -33,28 +37,56 @@ def collect(split_dir):
     return items
 
 
-def split_by_patient(items, val_frac=0.15, seed=42):
-    """Stratified patient-level split of `items` into (train, val)."""
-    by_patient = defaultdict(list)
+def load_groups(path=GROUPS_FILE):
+    """Return {scan_id: group_id}, or None if no grouping file exists."""
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)["groups"]
+
+
+def split_by_patient(items, val_frac=0.15, seed=42, groups=None):
+    """Stratified split of `items` into (train, val) at the subject level.
+
+    Without `groups`, each scan ID is its own unit. With `groups`, all scan IDs
+    mapped to the same group (repeat scans of one subject) move together, so a
+    subject can never appear in both train and val.
+    """
+    groups = groups or {}
+    by_group = defaultdict(list)
     for p, y in items:
-        by_patient[(patient_id(p), y)].append((p, y))
+        pid = patient_id(p)
+        by_group[groups.get(pid, pid)].append((p, y))
+
+    # Stratify on each group's majority label
+    def group_label(g):
+        ys = [y for _, y in by_group[g]]
+        return int(sum(ys) * 2 >= len(ys))
 
     rng = random.Random(seed)
     train, val = [], []
     for label in CLASSES.values():
-        keys = sorted(k for k in by_patient if k[1] == label)
+        keys = sorted(g for g in by_group if group_label(g) == label)
         rng.shuffle(keys)
         n_val = int(len(keys) * val_frac)
-        for i, k in enumerate(keys):
-            (val if i < n_val else train).extend(by_patient[k])
+        for i, g in enumerate(keys):
+            (val if i < n_val else train).extend(by_group[g])
     return train, val
 
 
-def get_splits(root=DATA_ROOT, val_frac=0.15, seed=42):
-    """Official test set + patient-level train/val split of the official train set."""
+def get_splits(root=DATA_ROOT, val_frac=0.15, seed=42, use_groups=True):
+    """Official test set + subject-level train/val split of the official train set.
+
+    If splits/train_groups.json exists (and use_groups=True), near-duplicate scan
+    IDs are grouped as one subject before splitting.
+    """
     train_all = collect(os.path.join(root, "train"))
     test = collect(os.path.join(root, "test"))
-    train, val = split_by_patient(train_all, val_frac, seed)
+    groups = load_groups() if use_groups else None
+    if use_groups and groups is None:
+        print("WARNING: no splits/train_groups.json - splitting by scan ID only "
+              "(repeat scans of one subject may leak into val).")
+    train, val = split_by_patient(train_all, val_frac, seed, groups)
     return train, val, test
 
 
