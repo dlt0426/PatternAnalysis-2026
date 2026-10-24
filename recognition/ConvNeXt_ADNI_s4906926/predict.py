@@ -13,7 +13,8 @@ For each checkpoint this script:
      threshold are deferred to a clinician. The deferral cut-off is chosen on
      validation for a target accuracy and then applied to test.
   7. Measures resources (parameters, inference latency, peak GPU memory).
-  8. Saves Grad-CAM overlays of the most confident errors for failure analysis.
+  8. Saves Grad-CAM overlays of the most confident false positives (NC called AD)
+     and false negatives (missed AD) for failure analysis.
 
 Usage:
     python predict.py outputs/convnext_2d/best.pt
@@ -342,23 +343,27 @@ def evaluate(ckpt_path, args, device):
         latency(model, in_chans, device, 64, reps=5)
         report["resources"]["peak_inference_mem_MB_batch64"] = torch.cuda.max_memory_allocated() / 1024 ** 2
 
-    # 6) failure cases: most confident wrong patients (+ one confident correct per class)
+    # 6) failure cases: the most confident false positives (NC called AD) and false
+    #    negatives (missed AD) are reported separately, plus one confident correct case per class
     pred = (tp >= t_star).long()
-    margin = confidence(tp, t_star)
-    wrong = [i for i in torch.argsort(margin, descending=True).tolist() if pred[i] != ty[i]][:args.n_failures]
-    right = []
-    for cls in (1, 0):
-        cand = [i for i in torch.argsort(margin, descending=True).tolist() if pred[i] == ty[i] == cls]
-        right += cand[:1]
+    order = torch.argsort(confidence(tp, t_star), descending=True).tolist()
     case = lambda i: {"id": ids[i], "label": ty[i].item(), "pred": pred[i].item(), "prob": tp[i].item()}
-    report["failure_cases"] = [case(i) for i in wrong]
-    failure_figure(model, ds["test"], [case(i) for i in wrong], device, os.path.join(out, "failures.png"))
+    fp = [i for i in order if pred[i] == 1 and ty[i] == 0][:args.n_failures]
+    fn = [i for i in order if pred[i] == 0 and ty[i] == 1][:args.n_failures]
+    right = [next(i for i in order if pred[i] == ty[i] == cls) for cls in (1, 0)
+             if any(pred[i] == ty[i] == cls for i in order)]
+    report["failure_cases"] = {"false_positives": [case(i) for i in fp],
+                               "false_negatives": [case(i) for i in fn]}
+    for kind, idx in [("false_positives", fp), ("false_negatives", fn)]:
+        print(f"  most confident {kind}: " + ", ".join(f"{ids[i]} (P(AD)={tp[i]:.2f})" for i in idx))
+        failure_figure(model, ds["test"], [case(i) for i in idx], device, os.path.join(out, f"{kind}.png"))
     failure_figure(model, ds["test"], [case(i) for i in right], device, os.path.join(out, "correct_examples.png"))
 
     with open(os.path.join(out, "metrics.json"), "w") as f:
         json.dump(report, f, indent=2)
     print_report(name, report)
-    print(f"Saved metrics.json, reliability.png, selective.png, failures.png, correct_examples.png to {out}/\n")
+    print(f"Saved metrics.json, reliability.png, selective.png, false_positives.png, false_negatives.png, "
+          f"correct_examples.png to {out}/\n")
     return name, report
 
 
@@ -393,7 +398,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--targets", type=float, nargs="+", default=[0.85, 0.9])
-    ap.add_argument("--n-failures", type=int, default=5)
+    ap.add_argument("--n-failures", type=int, default=3, help="cases per error type (FP and FN)")
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
