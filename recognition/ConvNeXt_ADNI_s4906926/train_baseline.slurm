@@ -16,7 +16,7 @@
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate comp3710
 
-cd ~/PatternAnalysis-2026/recognition/ConvNeXt_ADNI_s4906926
+cd "$SLURM_SUBMIT_DIR"   # run from the folder where sbatch was called
 nvidia-smi
 python train.py --model baseline --epochs 20 --batch-size 64 --lr 1e-3 \
     --num-workers 8 "$@"
