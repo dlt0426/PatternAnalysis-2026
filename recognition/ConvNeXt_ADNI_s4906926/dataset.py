@@ -178,10 +178,17 @@ def compute_mean_std(items, n=2000, seed=0):
     return mean, std
 
 
-def get_transforms(mean, std, train, channels=1):
-    """Augmentation is applied to the training set only; val/test are deterministic."""
+def get_transforms(mean, std, train, channels=1, aug="basic"):
+    """Augmentation is applied to the training set only; val/test are deterministic.
+
+    aug="basic" : flip + small affine.
+    aug="strong": larger affine, brightness/contrast jitter (scanner variation)
+                  and random erasing (forces the model to use several regions).
+    """
     norm = T.Normalize([mean] * channels, [std] * channels)
-    if train:
+    if not train:
+        return T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)), T.ToTensor(), norm])
+    if aug == "basic":
         return T.Compose([
             T.Resize((IMG_SIZE, IMG_SIZE)),
             T.RandomHorizontalFlip(),                       # brains are roughly left-right symmetric
@@ -189,10 +196,21 @@ def get_transforms(mean, std, train, channels=1):
             T.ToTensor(),
             norm,
         ])
-    return T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)), T.ToTensor(), norm])
+    if aug == "strong":
+        return T.Compose([
+            T.Resize((IMG_SIZE, IMG_SIZE)),
+            T.RandomHorizontalFlip(),
+            T.RandomAffine(degrees=15, translate=(0.08, 0.08), scale=(0.9, 1.1)),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.ToTensor(),
+            norm,
+            T.RandomErasing(p=0.25, scale=(0.02, 0.1), value=0.0),
+        ])
+    raise ValueError(f"Unknown aug: {aug}")
 
 
-def get_loaders(batch_size=64, num_workers=4, root=DATA_ROOT, smoke=False, split="official", context=0):
+def get_loaders(batch_size=64, num_workers=4, root=DATA_ROOT, smoke=False, split="official", context=0,
+                aug="basic"):
     """Build train/val/test DataLoaders.
 
     smoke=True keeps only a small random subset of each split so the whole
@@ -210,7 +228,7 @@ def get_loaders(batch_size=64, num_workers=4, root=DATA_ROOT, smoke=False, split
 
     def make(items, train_mode):
         return DataLoader(
-            ADNIDataset(items, get_transforms(mean, std, train_mode, channels), context),
+            ADNIDataset(items, get_transforms(mean, std, train_mode, channels, aug), context),
             batch_size=batch_size, shuffle=train_mode,
             num_workers=num_workers, pin_memory=torch.cuda.is_available(),
         )

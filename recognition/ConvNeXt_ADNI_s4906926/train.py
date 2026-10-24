@@ -48,17 +48,25 @@ def parse_args():
     p.add_argument("--split", default="official", choices=["official", "train"],
                    help="official: val/test = halves of the official test folder (default); "
                         "train: legacy val carved from the train folder (leaks subjects)")
+    p.add_argument("--aug", default="basic", choices=["basic", "strong"], help="training augmentation")
+    p.add_argument("--mixup", type=float, default=0.0, help="mixup Beta(alpha, alpha); 0 = off")
+    p.add_argument("--patience", type=int, default=0,
+                   help="stop if val accuracy has not improved for this many epochs (0 = off)")
     p.add_argument("--context-slices", type=int, default=0, choices=[0, 1],
                    help="0 = single slice (1 channel); 1 = 2.5D, slices s-1,s,s+1 as 3 channels")
     p.add_argument("--smoke", action="store_true", help="tiny subset, 1 epoch, for debugging")
     return p.parse_args()
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, amp=False):
+def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, amp=False, mixup=0.0):
     """One pass over `loader`. Trains if an optimizer is given, otherwise evaluates.
 
     Returns mean loss, slice accuracy, and per-slice (prob_AD, label, patient_id)
     so that patient-level metrics can be computed afterwards.
+
+    mixup > 0 (training only): each batch is blended with a shuffled copy of
+    itself, x = lam*x_i + (1-lam)*x_j, and the loss is blended the same way.
+    Training accuracy is then measured against the dominant label only.
     """
     training = optimizer is not None
     model.train(training)
@@ -68,10 +76,18 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, 
     with torch.set_grad_enabled(training):
         for x, y, pid in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            use_mix = training and mixup > 0
+            if use_mix:
+                lam = torch.distributions.Beta(mixup, mixup).sample().item()
+                perm = torch.randperm(x.size(0), device=device)
+                x = lam * x + (1 - lam) * x[perm]
+
             # bfloat16 autocast: faster on A100 and halves activation memory
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
                 logits = model(x)
                 loss = criterion(logits, y)
+                if use_mix:
+                    loss = lam * loss + (1 - lam) * criterion(logits, y[perm])
             logits = logits.float()
 
             if training:
@@ -163,7 +179,7 @@ def main():
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
     loaders, (mean, std) = get_loaders(args.batch_size, args.num_workers, args.data_root, args.smoke,
-                                       args.split, args.context_slices)
+                                       args.split, args.context_slices, args.aug)
     print(f"Slices  train={len(loaders['train'].dataset)}  val={len(loaders['val'].dataset)}  "
           f"test={len(loaders['test'].dataset)}  | split={args.split} context={args.context_slices} "
           f"| mean={mean:.4f} std={std:.4f}")
@@ -181,13 +197,15 @@ def main():
 
     history = defaultdict(list)
     best_val, ckpt_path = -1.0, os.path.join(args.out, "best.pt")
+    epochs_since_best = 0
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         lr_now = optimizer.param_groups[0]["lr"]
-        tr_loss, tr_acc, *_ = run_epoch(model, loaders["train"], criterion, device, optimizer, scheduler, amp)
+        tr_loss, tr_acc, *_ = run_epoch(model, loaders["train"], criterion, device, optimizer, scheduler, amp,
+                                        args.mixup)
         va_loss, va_acc, va_p, va_y, va_pid = run_epoch(model, loaders["val"], criterion, device, amp=amp)
         va_pat_acc = summarise(*patient_level(va_p, va_y, va_pid))["acc"]
 
@@ -201,11 +219,16 @@ def main():
 
         # Model selection uses the validation set only (never the test set).
         if va_acc > best_val:
-            best_val = va_acc
+            best_val, epochs_since_best = va_acc, 0
             torch.save({"model": args.model, "state_dict": model.state_dict(),
                         "mean": mean, "std": std, "epoch": epoch, "args": vars(args)}, ckpt_path)
+        else:
+            epochs_since_best += 1
 
         plot_history(history, os.path.join(args.out, "curves.png"))
+        if args.patience and epochs_since_best >= args.patience:
+            print(f"Early stopping: no val improvement for {args.patience} epochs.")
+            break
 
     # ---- Final, one-off evaluation on the held-out test set ----
     ckpt = torch.load(ckpt_path, map_location=device)
