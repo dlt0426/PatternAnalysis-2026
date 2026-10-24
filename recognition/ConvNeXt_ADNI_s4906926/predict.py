@@ -13,7 +13,9 @@ For each checkpoint this script:
      threshold are deferred to a clinician. The deferral cut-off is chosen on
      validation for a target accuracy and then applied to test.
   7. Measures resources (parameters, inference latency, peak GPU memory).
-  8. Saves Grad-CAM overlays of the most confident false positives (NC called AD)
+  8. Saves per-patient predictions (CSV) and compares accuracy for scans with
+     the standard slice range vs shifted ranges (Fisher's exact test).
+  9. Saves Grad-CAM overlays of the most confident false positives (NC called AD)
      and false negatives (missed AD) for failure analysis.
 
 Usage:
@@ -260,6 +262,66 @@ def failure_figure(model, dataset, cases, device, path):
 
 
 # ---------------------------------------------------------------------------
+# Per-patient predictions and slice-range subgroup analysis
+# ---------------------------------------------------------------------------
+def slice_ranges(items):
+    """scan_id -> (first slice index, last slice index)."""
+    r = defaultdict(list)
+    for p, _ in items:
+        r[patient_id(p)].append(slice_index(p))
+    return {k: (min(v), max(v)) for k, v in r.items()}
+
+
+def save_predictions(path, ids, prob, labels, t, ranges):
+    """CSV with one row per patient (used for the subgroup and failure analysis)."""
+    with open(path, "w") as f:
+        f.write("scan_id,label,prob_ad,pred,correct,first_slice,last_slice\n")
+        for i, pid in enumerate(ids):
+            pred = int(prob[i] >= t)
+            f.write(f"{pid},{labels[i].item()},{prob[i]:.4f},{pred},{int(pred == labels[i].item())},"
+                    f"{ranges[pid][0]},{ranges[pid][1]}\n")
+
+
+def slice_range_subgroups(ids, prob, labels, t, ranges, split_name):
+    """Accuracy for scans whose slice range is the most common one vs all others.
+
+    Scans with a shifted slice range cover a different part of the brain, which
+    the failure cases suggest may hurt accuracy. Fisher's exact test checks
+    whether the error rates of the two groups differ.
+    """
+    from scipy.stats import fisher_exact
+    firsts = [ranges[pid][0] for pid in ids]
+    standard = max(set(firsts), key=firsts.count)
+    pred = (prob >= t).long()
+    rows, table = {}, []
+    for name, keep in [(f"standard (first slice {standard})", [f == standard for f in firsts]),
+                       ("shifted (any other range)", [f != standard for f in firsts])]:
+        m = torch.tensor(keep)
+        n = int(m.sum())
+        if n == 0:
+            continue
+        correct = int((pred[m] == labels[m]).sum())
+        y, pr = labels[m], pred[m]
+        sens = ((pr == 1) & (y == 1)).sum().item() / max(1, (y == 1).sum().item())
+        spec = ((pr == 0) & (y == 0)).sum().item() / max(1, (y == 0).sum().item())
+        rows[name] = {"n": n, "n_AD": int((y == 1).sum()), "acc": correct / n, "sensitivity_AD": sens,
+                      "specificity_NC": spec}
+        table.append([correct, n - correct])
+    if len(table) == 2:
+        rows["fisher_exact_p"] = fisher_exact(table)[1]
+    counts = {f: firsts.count(f) for f in sorted(set(firsts))}
+    rows["first_slice_counts"] = counts
+    print(f"  [{split_name}] first-slice index counts: {counts}")
+    for name, r in rows.items():
+        if isinstance(r, dict) and "acc" in r:
+            print(f"  [{split_name}] {name:32s} n={r['n']:3d} (AD {r['n_AD']:3d})  acc {r['acc']:.3f}  "
+                  f"sens {r['sensitivity_AD']:.3f}  spec {r['specificity_NC']:.3f}")
+    if "fisher_exact_p" in rows:
+        print(f"  [{split_name}] Fisher exact test (errors standard vs shifted): p = {rows['fisher_exact_p']:.4f}")
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation
 # ---------------------------------------------------------------------------
 def evaluate(ckpt_path, args, device):
@@ -359,11 +421,19 @@ def evaluate(ckpt_path, args, device):
         failure_figure(model, ds["test"], [case(i) for i in idx], device, os.path.join(out, f"{kind}.png"))
     failure_figure(model, ds["test"], [case(i) for i in right], device, os.path.join(out, "correct_examples.png"))
 
+    # 7) per-patient predictions + slice-range subgroup analysis (val and test)
+    report["slice_range_subgroups"] = {}
+    for split_name, items in [("val", val_items), ("test", test_items)]:
+        pids, p, y = res[split_name]["pat"]["prob_cal"]
+        ranges = slice_ranges(items)
+        save_predictions(os.path.join(out, f"{split_name}_predictions.csv"), pids, p, y, t_star, ranges)
+        report["slice_range_subgroups"][split_name] = slice_range_subgroups(pids, p, y, t_star, ranges, split_name)
+
     with open(os.path.join(out, "metrics.json"), "w") as f:
         json.dump(report, f, indent=2)
     print_report(name, report)
     print(f"Saved metrics.json, reliability.png, selective.png, false_positives.png, false_negatives.png, "
-          f"correct_examples.png to {out}/\n")
+          f"correct_examples.png, val_predictions.csv, test_predictions.csv to {out}/\n")
     return name, report
 
 
