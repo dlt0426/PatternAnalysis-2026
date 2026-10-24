@@ -5,6 +5,7 @@ Examples:
     python train.py --model baseline --epochs 20 --out outputs/baseline
     python train.py --model convnext --pretrained --epochs 30 --lr 1e-4 \
         --weight-decay 0.05 --warmup-epochs 3 --label-smoothing 0.1 --out outputs/convnext
+    python train.py --model convnext --pretrained --context-slices 1 ...   # 2.5D input
     python train.py --model convnext --pretrained --smoke   # quick pipeline check
 
 The checkpoint with the best validation accuracy is saved and evaluated once
@@ -44,6 +45,11 @@ def parse_args():
     p.add_argument("--warmup-epochs", type=float, default=0, help="linear LR warmup before cosine decay")
     p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--no-amp", action="store_true", help="disable bfloat16 mixed precision on GPU")
+    p.add_argument("--split", default="official", choices=["official", "train"],
+                   help="official: val/test = halves of the official test folder (default); "
+                        "train: legacy val carved from the train folder (leaks subjects)")
+    p.add_argument("--context-slices", type=int, default=0, choices=[0, 1],
+                   help="0 = single slice (1 channel); 1 = 2.5D, slices s-1,s,s+1 as 3 channels")
     p.add_argument("--smoke", action="store_true", help="tiny subset, 1 epoch, for debugging")
     return p.parse_args()
 
@@ -156,11 +162,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    loaders, (mean, std) = get_loaders(args.batch_size, args.num_workers, args.data_root, args.smoke)
+    loaders, (mean, std) = get_loaders(args.batch_size, args.num_workers, args.data_root, args.smoke,
+                                       args.split, args.context_slices)
     print(f"Slices  train={len(loaders['train'].dataset)}  val={len(loaders['val'].dataset)}  "
-          f"test={len(loaders['test'].dataset)}  | mean={mean:.4f} std={std:.4f}")
+          f"test={len(loaders['test'].dataset)}  | split={args.split} context={args.context_slices} "
+          f"| mean={mean:.4f} std={std:.4f}")
 
-    model = build_model(args.model, pretrained=args.pretrained, drop_path=args.drop_path).to(device)
+    model = build_model(args.model, pretrained=args.pretrained, drop_path=args.drop_path,
+                        in_chans=2 * args.context_slices + 1).to(device)
     print(f"Model: {args.model}  pretrained={args.pretrained}  trainable params: {count_parameters(model):,}")
 
     amp = device.type == "cuda" and not args.no_amp

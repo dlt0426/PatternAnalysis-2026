@@ -233,8 +233,9 @@ def _fetch_imagenet_state_dict():
 def load_imagenet_weights(model):
     """Load ImageNet weights into a 1-channel ConvNeXt-T.
 
-    * Stem: RGB filters are summed over the colour axis. Feeding a grayscale
-      image x to this filter equals feeding (x, x, x) to the original RGB filter.
+    * Stem (1-channel model): RGB filters are summed over the colour axis.
+      Feeding a grayscale image x to this filter equals feeding (x, x, x) to
+      the original RGB filter. A 3-channel (2.5D) model uses the filters as-is.
     * Head: the 1000-class ImageNet classifier is discarded; ours stays random.
     """
     sd = _fetch_imagenet_state_dict()
@@ -252,12 +253,15 @@ def load_imagenet_weights(model):
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
-def build_model(name, num_classes=2, pretrained=False, drop_path=0.1):
-    """Select a model by name so train.py / predict.py stay model-agnostic."""
+def build_model(name, num_classes=2, pretrained=False, drop_path=0.1, in_chans=1):
+    """Select a model by name so train.py / predict.py stay model-agnostic.
+
+    in_chans=1 for single slices, 3 for 2.5D input (three adjacent slices).
+    """
     if name == "baseline":
-        return BaselineCNN(num_classes=num_classes)
+        return BaselineCNN(in_ch=in_chans, num_classes=num_classes)
     if name == "convnext":
-        model = ConvNeXt(in_chans=1, num_classes=num_classes, drop_path_rate=drop_path)
+        model = ConvNeXt(in_chans=in_chans, num_classes=num_classes, drop_path_rate=drop_path)
         if pretrained:
             load_imagenet_weights(model)
         return model

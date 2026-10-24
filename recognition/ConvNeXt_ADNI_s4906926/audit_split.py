@@ -23,9 +23,14 @@ Fix (--make-groups):
     pair is merged only if it is closer than 99% of genuinely different
     subjects (the official test set is subject-disjoint from train).
 
+  * The same threshold is used to group near-duplicate scan IDs inside the
+    official test folder (splits/test_groups.json), which dataset.py splits
+    into val / held-out test halves.
+
 Usage:
     python audit_split.py                    # audit the current split -> outputs/audit/
     python audit_split.py --make-groups      # build subject groups, then audit the new split
+    python audit_split.py --split train      # audit the legacy train-folder validation split
 """
 import argparse
 import json
@@ -39,7 +44,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dataset import get_splits, collect, patient_id, DATA_ROOT, GROUPS_FILE
+from dataset import get_splits, collect, patient_id, DATA_ROOT, GROUPS_FILE, TEST_GROUPS_FILE
 
 SIZE = 32
 
@@ -80,7 +85,7 @@ def describe(name, s, agree):
             "nn_label_agreement": agree.float().mean().item()}
 
 
-def make_groups(ids, labels, feats, threshold):
+def make_groups(ids, labels, feats, threshold, name="train"):
     """Union-find over scan IDs: link every pair with similarity > threshold."""
     parent = list(range(len(ids)))
 
@@ -102,7 +107,7 @@ def make_groups(ids, labels, feats, threshold):
     sizes = sorted((len(m) for m in members.values()), reverse=True)
     mixed = sum(1 for m in members.values() if len({labels[k].item() for k in m}) > 1)
     size_hist = {s: sizes.count(s) for s in sorted(set(sizes))}
-    print(f"\nGrouping @ threshold {threshold:.4f}: {len(ids)} scan IDs -> {len(members)} subject groups")
+    print(f"\n[{name}] grouping @ threshold {threshold:.4f}: {len(ids)} scan IDs -> {len(members)} subject groups")
     print(f"  group size histogram {{size: count}}: {size_hist}")
     print(f"  largest group: {sizes[0]}   groups with mixed AD/NC labels: {mixed}")
     return groups, {"threshold": threshold, "n_scans": len(ids), "n_groups": len(members),
@@ -110,7 +115,7 @@ def make_groups(ids, labels, feats, threshold):
 
 
 def audit(train, val, test, feats, out):
-    """Nearest-train-neighbour statistics for the current train/val split."""
+    """Nearest-train-neighbour statistics for the current train/val/test split."""
     def subset(items):
         keep = sorted({patient_id(p) for p, _ in items})
         idx = torch.tensor([feats["index"][k] for k in keep])
@@ -118,7 +123,7 @@ def audit(train, val, test, feats, out):
 
     tr_ids, tr_y, tr_f = subset(train)
     va_ids, va_y, va_f = subset(val)
-    te_ids, te_y, te_f = feats["test"]
+    te_ids, te_y, te_f = subset(test)
 
     s_tt, i_tt = nearest(tr_f, tr_f, exclude_self=True)   # train vs other train (reference)
     s_va, i_va = nearest(va_f, tr_f)
@@ -166,33 +171,38 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", default=DATA_ROOT)
     ap.add_argument("--out", default="outputs/audit")
-    ap.add_argument("--make-groups", action="store_true", help="build splits/train_groups.json")
+    ap.add_argument("--split", default="official", choices=["official", "train"])
+    ap.add_argument("--make-groups", action="store_true",
+                    help="build splits/train_groups.json and splits/test_groups.json")
     ap.add_argument("--threshold", type=float, default=None,
                     help="similarity above which two scan IDs are merged (default: test->train p99)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     print("Building fingerprints (CPU, a few minutes)...")
-    all_ids, all_y, all_f = fingerprints(collect(os.path.join(args.data_root, "train")))
-    test = fingerprints(collect(os.path.join(args.data_root, "test")))
-    feats = {"index": {pid: k for k, pid in enumerate(all_ids)}, "labels": all_y,
-             "matrix": all_f, "test": test}
+    tr_ids, tr_y, tr_f = fingerprints(collect(os.path.join(args.data_root, "train")))
+    te_ids, te_y, te_f = fingerprints(collect(os.path.join(args.data_root, "test")))
+    all_ids = tr_ids + te_ids
+    feats = {"index": {pid: k for k, pid in enumerate(all_ids)},
+             "labels": torch.cat([tr_y, te_y]), "matrix": torch.cat([tr_f, te_f])}
 
     report = {}
     if args.make_groups:
         thr = args.threshold
         if thr is None:
-            thr = torch.quantile(nearest(test[2], all_f)[0], 0.99).item()
-        groups, stats = make_groups(all_ids, all_y, all_f, thr)
+            thr = torch.quantile(nearest(te_f, tr_f)[0], 0.99).item()
         os.makedirs(os.path.dirname(GROUPS_FILE), exist_ok=True)
-        with open(GROUPS_FILE, "w") as f:
-            json.dump({**stats, "groups": groups}, f, indent=1)
-        print(f"Saved {GROUPS_FILE}")
-        report["grouping"] = stats
+        for name, ids, y, f, path in [("train", tr_ids, tr_y, tr_f, GROUPS_FILE),
+                                      ("test", te_ids, te_y, te_f, TEST_GROUPS_FILE)]:
+            groups, stats = make_groups(ids, y, f, thr, name)
+            with open(path, "w") as fh:
+                json.dump({**stats, "groups": groups}, fh, indent=1)
+            print(f"Saved {path}")
+            report[f"grouping_{name}"] = stats
 
-    train, val, _ = get_splits(args.data_root)
-    print(f"\nAuditing split: train={len(train)} slices, val={len(val)} slices")
-    report.update(audit(train, val, None, feats, args.out))
+    train, val, test = get_splits(args.data_root, args.split)
+    print(f"\nAuditing split '{args.split}': train={len(train)} val={len(val)} test={len(test)} slices")
+    report.update(audit(train, val, test, feats, args.out))
     with open(os.path.join(args.out, "nn_audit.json"), "w") as f:
         json.dump(report, f, indent=2)
     print(f"\nSaved nn_audit.png and nn_audit.json to {args.out}/")
