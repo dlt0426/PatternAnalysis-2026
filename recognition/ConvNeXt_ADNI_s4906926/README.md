@@ -3,7 +3,7 @@
 **COMP3710 Pattern Recognition Report 2026 — Classification (Hard): ConvNeXt on ADNI**
 Author: s4906926
 
-> **Summary.** A ConvNeXt-T network, implemented from scratch in PyTorch and initialised from ImageNet-1k weights, classifies T1-weighted brain MRI scans as Alzheimer's disease (AD) or cognitively normal (NC). On a held-out, subject-disjoint test set of 227 scans it reaches **82.8 % patient-level accuracy** (95 % CI 78.0–87.7 %), **AUROC 0.892**, and **80.2 % sensitivity**, compared with 75.3 % accuracy and 0.850 AUROC for a plain CNN baseline. While building it we found that a validation set carved from the official training folder **leaks subjects** (validation accuracy 0.98 against test 0.75). We confirmed the leak with a model-free nearest-neighbour audit and rebuilt the evaluation protocol to remove it. The report closes with a calibrated deferral rule and a deployment recommendation.
+> **Summary.** A ConvNeXt-T network, implemented from scratch in PyTorch and initialised from ImageNet-1k weights, classifies T1-weighted brain MRI scans as Alzheimer's disease (AD) or cognitively normal (NC). On a held-out test set of 227 scans (independent of the training scans at the scan level; subject-level independence is assumed from the official split but could not be verified, see [Limitations](#12-limitations-and-future-work)) it reaches **82.8 % patient-level accuracy** (95 % CI 78.0–87.7 %), **AUROC 0.892**, and **80.2 % sensitivity**, compared with 75.3 % accuracy and 0.850 AUROC for a plain CNN baseline. While building it we found that a validation set carved from the official training folder **leaks subjects** (validation accuracy 0.98 against test 0.75). We confirmed the leak with a model-free nearest-neighbour audit and rebuilt the evaluation protocol to remove it. The report closes with a calibrated deferral rule and a deployment recommendation.
 
 ![Pipeline and ConvNeXt block](images/architecture.png)
 
@@ -23,8 +23,9 @@ Author: s4906926
 10. [Usage](#10-usage)
 11. [Dependencies and reproducibility](#11-dependencies-and-reproducibility)
 12. [Limitations and future work](#12-limitations-and-future-work)
-13. [Artificial Intelligence Usage Disclosure](#13-artificial-intelligence-usage-disclosure)
-14. [References](#14-references)
+13. [Conclusion](#13-conclusion)
+14. [Artificial Intelligence Usage Disclosure](#14-artificial-intelligence-usage-disclosure)
+15. [References](#15-references)
 
 ---
 
@@ -59,11 +60,11 @@ ConvNeXt (Liu et al., 2022) "modernises" a ResNet with design choices borrowed f
 
 | # | Criterion | Outcome (final model) |
 |---|---|---|
-| AC1 | Patient-level test accuracy ≥ 0.80 on a **subject-disjoint** held-out set | ✅ 0.828 (95 % CI 0.780–0.877; lower bound below 0.80) |
+| AC1 | Patient-level test accuracy ≥ 0.80 on a **subject-disjoint** held-out set | ✅ 0.828 (95 % CI 0.780–0.877; lower bound below 0.80); test set is scan-disjoint from training, subject-disjointness assumed but not verified (see AC5) |
 | AC2 | AUROC ≥ 0.85 and AD sensitivity ≥ 0.80 at the deployed operating point (a missed AD case costs more than a false alarm) | ✅ AUROC 0.892, sensitivity 0.802 |
 | AC3 | Calibrated confidence: patient-level ECE ≤ 0.10, and a deferral rule giving ≥ 85 % accuracy on automated cases while deferring ≤ 25 % | ✅ ECE 0.066; 13.7 % deferred → 87.2 % accuracy |
 | AC4 | Resources: training ≤ 1 GPU-hour on one A100, peak training VRAM ≤ 16 GB, inference ≤ 100 ms per patient | ✅ ~12 min, 4.3 GB, 28.8 ms |
-| AC5 | No subject overlap between training and evaluation data, **verified empirically**, not just assumed | ✅ after the fix in Section 4 |
+| AC5 | No subject overlap between training and evaluation data, **verified empirically**, not just assumed | ⚠️ Partially met: zero scan-ID overlap and near-duplicate grouping verified; subject-level independence could not be verified because the course data contains no subject IDs. |
 
 **Model choice and course concepts.** ConvNeXt-T (Hard band) was chosen because it is a modern CNN whose design rationale (Liu et al., 2022) can be explained step by step from ResNet, and because ImageNet transfer learning is well established for small medical datasets. The baseline is a 4-stage plain CNN (Conv–BN–ReLU–MaxPool, 0.39 M parameters). Patient-level aggregation of slice probabilities uses the multi-slice structure of the data.
 
@@ -96,10 +97,10 @@ ConvNeXt (Liu et al., 2022) "modernises" a ResNet with design choices borrowed f
 | Split | Source | Scans (AD / NC) | Slices |
 |---|---|---|---|
 | Train | entire official `train/` folder | 1,076 (520 / 556) | 21,520 |
-| Validation | half of official `test/` folder, grouped by subject, stratified | 223 (107 / 116) | 4,460 |
+| Validation | half of official `test/` folder, near-duplicate scans grouped, stratified | 223 (107 / 116) | 4,460 |
 | Test (held out) | other half of official `test/` folder | 227 (116 / 111) | 4,540 |
 
-**Why not take validation from the training folder?** Section 4 shows that the official training folder contains repeat scans of the same subjects under different scan IDs. A validation set drawn from it therefore shares subjects with the training set. The official train and test folders, by contrast, appear subject-disjoint: test scans have no near-duplicates in the training folder (1-NN label agreement 57 %, close to chance), and once validation was taken from the test folder, validation and test accuracy agreed (Section 4). Splitting the test folder in half therefore gives a validation set that comes from the same distribution as the test set and shares no subjects with training. The test half is used once, only for the final numbers. Before halving, near-duplicate scan IDs inside the test folder are merged into groups ([`splits/test_groups.json`](splits/test_groups.json)) so that both halves never contain the same scan twice. Splits are deterministic (seed 42), and [`check_split.py`](check_split.py) verifies that scan-ID and subject-group overlap is zero for every pair of splits.
+**Why not take validation from the training folder?** Section 4 shows that the official training folder contains repeat scans of the same subjects under different scan IDs. A validation set drawn from it therefore shares subjects with the training set. The official train and test folders, by contrast, are *assumed* to be split by subject. The audit found no near-duplicates across the two folders (1-NN label agreement 57 %, close to chance), and once validation was taken from the test folder, validation and test accuracy agreed (Section 4). This is consistent with, but does not prove, subject-level separation: the course data contains no subject IDs, so it cannot be checked directly (Section 12). Splitting the test folder in half therefore gives a validation set that comes from the same distribution as the test set and, under this assumption, shares no subjects with training. The test half is used once, only for the final numbers. Before halving, near-duplicate scan IDs inside the test folder are merged into groups ([`splits/test_groups.json`](splits/test_groups.json)) so that both halves never contain the same scan twice. Splits are deterministic (seed 42), and [`check_split.py`](check_split.py) verifies that scan-ID and near-duplicate-group overlap is zero for every pair of splits.
 
 ---
 
@@ -144,7 +145,7 @@ Even with near-duplicates grouped, ConvNeXt reached 0.93 patient accuracy on val
 
 ### Why grouping near-duplicates was not enough
 
-Merging scan IDs with similarity above 0.978 (union–find; at most 5 scan IDs per group) removed exact re-exports, but ConvNeXt's validation accuracy stayed at 0.99. ADNI is longitudinal: the same person is rescanned months or years apart. Those scans differ in head pose and degree of atrophy, so their *pixel* similarity is no higher than between two unrelated people, and the audit cannot detect them. A 28 M-parameter network can still recognise the individual from cortical folding and ventricle shape. Because the file names carry no subject identifiers, **this leak cannot be removed from inside the training folder.** The validation set was therefore moved to the subject-disjoint test folder (Section 3). After the change, validation and test accuracy agree to within one point for both models (last two rows of the table above).
+Merging scan IDs with similarity above 0.978 (union–find; at most 5 scan IDs per group) removed exact re-exports, but ConvNeXt's validation accuracy stayed at 0.99. ADNI is longitudinal: the same person is rescanned months or years apart. Those scans differ in head pose and degree of atrophy, so their *pixel* similarity is no higher than between two unrelated people, and the audit cannot detect them. A 28 M-parameter network can still recognise the individual from cortical folding and ventricle shape. Because the file names carry no subject identifiers, **this leak cannot be removed from inside the training folder.** The validation set was therefore moved to the official test folder, which is assumed to be subject-disjoint from the training folder (Section 3). After the change, validation and test accuracy agree to within one point for both models (last two rows of the table above). Without subject IDs, however, longitudinal repeats of the same person across the official train and test folders cannot be ruled out, because the audit only detects near-identical scans (Section 12).
 
 ---
 
@@ -333,13 +334,13 @@ For contrast, a correctly classified AD scan (attention on parietal sulci) and N
 | File | Purpose |
 |---|---|
 | [`modules.py`](modules.py) | `BaselineCNN`; ConvNeXt components (`LayerNorm2d`, `DropPath`, `ConvNeXtBlock`, `ConvNeXt`); ImageNet weight loading; `build_model` factory. PyTorch only (no NumPy). |
-| [`dataset.py`](dataset.py) | File discovery, subject-grouped stratified splitting, `ADNIDataset` (2-D or 2.5-D), normalisation statistics, augmentation, `DataLoader`s. |
+| [`dataset.py`](dataset.py) | File discovery, near-duplicate-grouped stratified splitting, `ADNIDataset` (2-D or 2.5-D), normalisation statistics, augmentation, `DataLoader`s. |
 | [`train.py`](train.py) | Training, validation and one final test evaluation; warm-up + cosine LR, label smoothing, mixup, early stopping, bf16; saves `best.pt`, `curves.png`, `results.json`. |
 | [`predict.py`](predict.py) | Loads checkpoints and runs the full evaluation (Sections 6–8): calibration, threshold, bootstrap CIs, deferral, resources, Grad-CAM, per-patient CSVs. |
 | [`audit_split.py`](audit_split.py) | Nearest-neighbour leakage audit; `--make-groups` writes `splits/*_groups.json`. |
-| [`check_split.py`](check_split.py) | Prints split sizes and asserts zero scan/subject overlap. |
+| [`check_split.py`](check_split.py) | Prints split sizes and asserts zero scan-ID and near-duplicate-group overlap. |
 | `train_baseline.slurm`, `train_convnext.slurm` | Slurm scripts for Rangpur; extra arguments are passed through to `train.py`. |
-| `splits/` | Subject-group mappings (small JSON files; required to reproduce the splits). |
+| `splits/` | Near-duplicate group mappings (small JSON files; required to reproduce the splits). |
 
 ### Commands (on Rangpur)
 
@@ -395,7 +396,7 @@ Outputs are written to `<checkpoint folder>/eval/`: `metrics.json`, `reliability
 Hardware: Rangpur HPC, one NVIDIA A100-PCIE-40GB per run (`comp3710` partition), conda environment.
 
 **Reproducibility.**
-* Splits are deterministic (seed 42), and the subject-group files in `splits/` are committed.
+* Splits are deterministic (seed 42), and the near-duplicate group files in `splits/` are committed.
 * Model weights and datasets are not committed (course rule).
 * Each run stores its full argument list in `best.pt` and `results.json`.
 * Normalisation statistics are stored in the checkpoint, so `predict.py` needs no training data.
@@ -405,16 +406,26 @@ Hardware: Rangpur HPC, one NVIDIA A100-PCIE-40GB per run (`comp3710` partition),
 
 ## 12. Limitations and future work
 
+* **Patient-level independence is unverified.** The course copy of ADNI contains no subject identifiers, and the similarity-based grouping only catches near-duplicate (re-exported) scans, not longitudinal rescans of the same person. Independence between training and evaluation subjects therefore rests on the assumption that the official train/test folders were split by subject, and the reported accuracy should be read with this caveat. The necessary fix is to rebuild all splits from ADNI subject IDs (metadata not provided with the course data).
 * **Small evaluation sets.** About 225 patients per split gives ±5 point accuracy intervals and cannot separate the ConvNeXt variants.
-* **Validation and test are halves of one folder.** They share no subjects with training. However, longitudinal repeats of a test-folder subject that are not near-identical can fall on both sides, which makes validation and test slightly correlated (the threshold transfers somewhat too well).
-* **No subject IDs.** The real fix is to rebuild all splits from ADNI's subject identifiers.
+* **Validation and test are halves of one folder.** They are assumed to share no subjects with training (first bullet). However, longitudinal repeats of a test-folder subject that are not near-identical can fall on both sides, which makes validation and test slightly correlated (the threshold transfers somewhat too well).
 * **2-D slices only.** A 3-D or multi-view model, plus age as a covariate, is the most promising route beyond ~0.83.
 * **Grad-CAM resolution.** At 7×7 it is coarse; the failure analysis is qualitative and was checked statistically only for the slice-range hypothesis.
 * **Label smoothing vs calibration** (Section 7). Next experiment: train without label smoothing and compare whether confidence catches the confident misses.
 
 ---
 
-## 13. Artificial Intelligence Usage Disclosure
+## 13. Conclusion
+
+This project implemented ConvNeXt-T from scratch in PyTorch (verified against the reference implementation with identical outputs) and applied it, with ImageNet-1k initialisation, to AD vs NC classification on ADNI brain MRI. On a held-out test set of 227 scans, ConvNeXt reached a patient-level accuracy of 0.828 (95 % CI 0.780–0.877) and an AUROC of 0.892, outperforming a plain CNN baseline (0.753 accuracy, 0.850 AUROC) on every reported metric, at a modest computational cost (28.8 ms per patient on an A100).
+
+The most important finding concerns evaluation rather than architecture. A validation set drawn from the official training folder contains repeat scans of the same subjects, which inflated validation accuracy to 0.98 while test accuracy remained 0.75. A model-free nearest-neighbour audit confirmed this leakage, and the protocol was changed so that model selection, calibration and threshold tuning use data from the official test folder only. After this change, validation and test accuracy agree closely. However, because the course copy of ADNI contains no subject identifiers, subject-level independence between training and evaluation scans relies on the official folder separation and could not be verified directly; the reported accuracy should be interpreted with this caveat.
+
+For the open research dilemma, both models were overconfident before temperature scaling. After calibration, a validation-tuned deferral rule lets ConvNeXt automate 86 % of cases at 87 % accuracy, deferring about four times fewer patients than the baseline for the same target. Confidence does not catch every dangerous error: label-smoothing saturation produced confidently missed AD cases. ConvNeXt is therefore recommended only as a rule-in triage aid. Before any clinical use, the splits should be rebuilt from true subject IDs, the model retrained without label smoothing, and performance validated on an external cohort.
+
+---
+
+## 14. Artificial Intelligence Usage Disclosure
 
 **Tools used.** Claude (Anthropic), used through a chat interface over the whole project.
 
@@ -440,7 +451,7 @@ I take full responsibility for all code and results in this submission.
 
 ---
 
-## 14. References
+## 15. References
 
 1. Z. Liu, H. Mao, C.-Y. Wu, C. Feichtenhofer, T. Darrell, S. Xie. *A ConvNet for the 2020s.* CVPR 2022.
 2. R. R. Selvaraju et al. *Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization.* ICCV 2017.
